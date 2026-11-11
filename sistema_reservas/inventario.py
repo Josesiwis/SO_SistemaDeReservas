@@ -1,17 +1,28 @@
-"""Inventario persistente de la simulación."""
+"""
+Módulo de inventario persistente y concurrencia de datos.
+Implementa el modelo de Lectores-Escritores y exclusión mutua mediante SQLite.
+"""
 
 from contextlib import closing
 import secrets
 import sqlite3
 
+# Canales de venta concurrentes soportados por el sistema
 CANALES = ("Web", "Ventanilla 1", "Ventanilla 2")
 
 
 class OperacionInvalida(ValueError):
+    """Excepción lanzada cuando una regla de negocio o restricción de concurrencia falla."""
     pass
 
 
 def conectar(ruta):
+    """
+    Establece conexión con la base de datos SQLite con timeout defensivo.
+    - timeout=5: Espera hasta 5 segundos si otro proceso escritor retiene el candado de escritura.
+    - row_factory: Permite acceder a las columnas por nombre (tipo diccionario).
+    - foreign_keys = ON: Activa la integridad referencial del motor relacional.
+    """
     conexion = sqlite3.connect(ruta, timeout=5)
     conexion.row_factory = sqlite3.Row
     conexion.execute("PRAGMA foreign_keys = ON")
@@ -19,6 +30,16 @@ def conectar(ruta):
 
 
 def inicializar(ruta):
+    """
+    Crea el esquema inicial de base de datos y configura el modo de sincronización.
+    
+    FUNDAMENTO DE SISTEMAS OPERATIVOS:
+    - 'PRAGMA journal_mode = WAL' activa el Write-Ahead Logging.
+      En modo WAL, las lecturas no bloquean a las escrituras y las escrituras no bloquean
+      a las lecturas (Problema clásico de Lectores-Escritores resuelto por instantáneas).
+    - El índice parcial 'asiento_activo' garantiza la exclusión mutua: sólo puede existir
+      una reserva activa (cancelada IS NULL) para cada tupla (bus_id, asiento).
+    """
     with closing(conectar(ruta)) as conexion, conexion:
         conexion.execute("PRAGMA journal_mode = WAL")
         conexion.executescript("""
@@ -38,6 +59,7 @@ def inicializar(ruta):
                 pagada TEXT,
                 cancelada TEXT
             );
+            -- Exclusión mutua granular: una sola reserva activa por asiento
             CREATE UNIQUE INDEX IF NOT EXISTS asiento_activo
             ON reservas(bus_id, asiento) WHERE cancelada IS NULL;
         """)
@@ -50,6 +72,14 @@ def inicializar(ruta):
 
 
 def consultar_buses(ruta):
+    """
+    Operación de sólo lectura: obtiene el estado actual de los buses y asientos ocupados.
+    
+    FUNDAMENTO DE SISTEMAS OPERATIVOS:
+    - Abre una transacción con 'BEGIN' en modo lectura compartida.
+    - Gracias a WAL, lee una instantánea coherente del inventario sin impedir
+      que los procesos trabajadores sigan procesando reservas simultáneamente.
+    """
     with closing(conectar(ruta)) as conexion:
         conexion.execute("BEGIN")
         buses = [dict(bus) for bus in conexion.execute("SELECT * FROM buses ORDER BY id")]
@@ -64,6 +94,10 @@ def consultar_buses(ruta):
 
 
 def consultar_reserva(ruta, codigo):
+    """
+    Consulta puntual de una reserva por su token alfanumérico.
+    Lectura atómica de solo lectura que une los datos del boleto con la información del bus.
+    """
     with closing(conectar(ruta)) as conexion:
         fila = conexion.execute(
             """SELECT reservas.*, buses.ruta FROM reservas
@@ -74,6 +108,15 @@ def consultar_reserva(ruta, codigo):
 
 
 def reservar(conexion, bus_id, asiento, canal):
+    """
+    Sección crítica de reserva de asiento dentro de una transacción exclusiva ya iniciada.
+    
+    PREVENCIÓN DE CONDICIONES DE CARRERA:
+    - Valida existencia del bus y rango válido del asiento.
+    - Utiliza 'INSERT INTO ... ON CONFLICT(...) DO NOTHING' respaldado por el índice parcial.
+    - Si otro proceso ganó la carrera para el mismo asiento en ese instante, el motor no inserta nada.
+    - Al evaluar rowcount != 1, detectamos el conflicto y lanzamos OperacionInvalida (HTTP 409).
+    """
     bus = conexion.execute("SELECT * FROM buses WHERE id = ?", (bus_id,)).fetchone()
     if bus is None or not 1 <= asiento <= bus["asientos"]:
         raise OperacionInvalida("El bus o el asiento seleccionado no existe.")
@@ -93,6 +136,20 @@ def reservar(conexion, bus_id, asiento, canal):
 
 
 def aplicar_operacion(ruta, operacion, *argumentos):
+    """
+    Despachador central de operaciones de escritura ejecutadas por los procesos trabajadores.
+    
+    PREVENCIÓN DE DEADLOCK Y SERIALIZACIÓN:
+    - Inicia con 'BEGIN IMMEDIATE'. Esto adquiere inmediatamente un bloqueo de escritura
+      reservado sobre la base de datos, impidiendo que dos procesos comiencen como lectores
+      y luego intenten escalar a escritores simultáneamente (la causa principal de deadlock en SQLite).
+    - Garantiza atomicidad completa (ACID) para reservar, pagar y cancelar.
+    - Máquina de estados:
+        * reservar: crea la reserva en estado 'Pendiente de pago'.
+        * pagar: pasa a 'Pagada' (idempotente si ya estaba pagada; rechaza si fue cancelada).
+        * cancelar: marca cancelada con timestamp (libera el asiento inmediatamente gracias
+          a la condición 'WHERE cancelada IS NULL' del índice único, y preserva la trazabilidad).
+    """
     with closing(conectar(ruta)) as conexion, conexion:
         conexion.execute("BEGIN IMMEDIATE")
         if operacion == "reservar":
