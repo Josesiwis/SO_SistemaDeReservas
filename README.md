@@ -1,91 +1,55 @@
 # Sistema de reservas de pasajes
 
-Primer avance académico para el curso de **Sistemas Operativos**, desarrollado en C++17. Simula dos ventanillas que intentan reservar asientos del mismo bus y utiliza sincronización entre procesos reales para evitar reservas duplicadas.
+Proyecto académico de **Sistemas Operativos**. La aplicación permite reservar asientos desde una interfaz web local que representa tres canales de venta: Web, Ventanilla 1 y Ventanilla 2. Incluye consulta por código, pago simulado, cancelación y persistencia en SQLite.
 
-## Alcance
+## Ejecutar la aplicación
 
-- Un bus de 10 asientos.
-- Un proceso principal y dos procesos hijos creados con `fork()`.
-- Cinco solicitudes predefinidas por ventanilla.
-- Memoria compartida con `mmap()` y exclusión mutua mediante un semáforo POSIX.
-- Registro de resultados con rol, PID y asiento, y verificación de contadores al finalizar.
+Con Python 3.10 o posterior, desde la raíz del repositorio:
 
-La implementación está en un único archivo: [`reservas_pasajes.cpp`](reservas_pasajes.cpp).
+```bash
+python3 -m sistema_reservas.web
+```
 
-## Requisitos
+Abre [http://127.0.0.1:8000](http://127.0.0.1:8000). La base `reservas.sqlite3` se crea al iniciar y conserva los datos entre ejecuciones. Los buses, destinos y tarifas son datos de ejemplo. Para cambiar la base, el puerto o la cantidad de trabajadores:
 
-- Linux o Windows con WSL, ejecutando los comandos dentro de Linux.
-- `g++` compatible con C++17.
-- No se necesitan bibliotecas externas ni base de datos.
+```bash
+python3 -m sistema_reservas.web --db otra.sqlite3 --puerto 8080 --trabajadores 3
+```
 
-## Compilar y ejecutar
+El servidor escucha en la interfaz local. La aplicación usa la biblioteca estándar de Python y los pagos y reembolsos son simulados.
 
-Desde la carpeta del repositorio:
+### Probar el flujo
+
+1. Elige un bus, un asiento libre y un canal. Pulsa **Reservar** y guarda el código.
+2. Pulsa **Simular pago** y comprueba el estado **Pagada**.
+3. Vuelve al inicio y consulta la reserva con su código.
+4. Pulsa **Cancelar reserva**. El asiento vuelve a estar disponible. Si tenía un pago, la consulta muestra **Cancelada con reembolso simulado**.
+
+## Sincronización
+
+| Concepto | Aplicación |
+| --- | --- |
+| Productor–consumidor | El servidor web recibe solicitudes de los tres canales. Un grupo de procesos trabajadores ejecuta las operaciones de escritura. Un semáforo de admisión limita el total de operaciones pendientes y en ejecución a la cantidad de trabajadores más 16. Una solicitud que excede ese límite recibe HTTP 503. |
+| Lectores–escritores | Las consultas leen el inventario mediante una instantánea de SQLite en modo WAL. Las escrituras empiezan con `BEGIN IMMEDIATE`, de modo que SQLite serializa a los escritores mientras los lectores pueden consultar el estado confirmado. |
+| Exclusión sobre un asiento | Un índice único parcial de SQLite admite una sola reserva activa por combinación de bus y asiento. Cancelar conserva el historial y libera el asiento dentro de la misma transacción. |
+
+Los trabajadores son procesos del sistema operativo creados mediante `multiprocessing`. Cada operación abre su propia conexión. El código de reserva permite consultar y gestionar la reserva desde cualquiera de los canales simulados.
+
+## Demostración original en C++17
+
+`reservas_pasajes.cpp` muestra el caso reducido con un bus y dos hijos creados con `fork()`. Usa memoria compartida con `mmap()` y un semáforo POSIX para proteger la consulta, actualización y conteo de asientos. Ejecútalo en Linux o WSL:
 
 ```bash
 g++ -std=c++17 -Wall -Wextra -Wpedantic -pthread reservas_pasajes.cpp -o reservas_pasajes
 ./reservas_pasajes
 ```
 
-La opción `-pthread` habilita el soporte necesario para las primitivas POSIX; el programa utiliza procesos, sin crear hilos. El ejecutable generado se llama `reservas_pasajes`.
+El resultado esperado es de ocho reservas, dos rechazos y la línea `Verificacion: CORRECTA`. Los asientos 3 y 7 se disputan entre las dos ventanillas. Los asientos 4 y 8 quedan libres.
 
-## Funcionamiento
-
-El proceso principal reserva e inicializa la memoria compartida antes de llamar a `fork()`. Crea ambos hijos antes de esperar su finalización con `waitpid()`. Después muestra los asientos y contadores, comprueba su coherencia y libera los recursos.
-
-Cada hijo ejecuta únicamente las solicitudes de su ventanilla y termina con `_exit()` después de vaciar la salida.
-
-| Proceso hijo | Asientos solicitados |
-| --- | --- |
-| Ventanilla 1 | 1, 3, 5, 7, 9 |
-| Ventanilla 2 | 2, 3, 6, 7, 10 |
-
-Los asientos se muestran del 1 al 10 y se convierten a índices del 0 al 9, validando previamente el rango.
-
-### Memoria compartida
-
-La región creada con `MAP_SHARED | MAP_ANONYMOUS` contiene un arreglo fijo de 10 asientos, dos contadores de reservas exitosas y un semáforo inicializado mediante `sem_init()` con `pshared = 1` y valor inicial 1.
-
-| Valor de un asiento | Estado |
-| --- | --- |
-| 0 | Disponible |
-| 1 | Reservado por la ventanilla 1 |
-| 2 | Reservado por la ventanilla 2 |
-
-`fork()` por sí solo proporciona espacios de memoria separados: modificar una variable normal en un hijo no actualiza la del padre ni la del otro hijo. El mapeo compartido permite que los tres procesos observen las modificaciones de estos datos.
-
-### Sección crítica
-
-Para cada solicitud, el hijo adquiere el semáforo con `sem_wait()`, consulta la disponibilidad y, si corresponde, registra al propietario e incrementa su contador. También imprime el resultado y vacía el búfer dentro de la misma sección crítica. Finalmente libera el semáforo con `sem_post()`.
-
-La consulta y la actualización son indivisibles respecto de la otra ventanilla, por lo que ambas no pueden reservar el mismo asiento. Las demoras breves se realizan fuera de la sección crítica y solo facilitan observar la ejecución; la sincronización depende del semáforo.
-
-### Manejo de errores
-
-Se comprueban las operaciones de memoria, semáforos, creación y espera de procesos. Las llamadas a `sem_wait()` y `waitpid()` se reintentan ante `EINTR`. Si falla la creación de un hijo o un hijo termina con error, el principal termina y recoge los hijos restantes antes de liberar los recursos.
-
-## Resultados esperados y validación
-
-En una ejecución correcta:
-
-- Los hijos tienen PID distintos y realizan cinco intentos cada uno.
-- Los asientos 3 y 7 se reservan una sola vez cada uno.
-- Se producen ocho reservas exitosas y dos rechazos.
-- Los asientos 4 y 8 quedan libres.
-- Los contadores coinciden con los ocho asientos ocupados.
-- Se imprime `Verificacion: CORRECTA` y el programa termina con código 0.
-
-El orden de los mensajes y la ventanilla que obtiene los asientos 3 y 7 pueden variar según la planificación del sistema operativo.
-
-Para ejecutar con un límite externo de tres segundos y detectar posibles bloqueos:
+## Prueba automatizada
 
 ```bash
-timeout 3s ./reservas_pasajes
-echo $?
+python3 -m unittest discover -s tests
 ```
 
-El código 0 indica finalización correcta; 124 indica que `timeout` agotó el límite. Durante la validación inicial se comprobaron 40 ejecuciones con este límite, sin bloqueos y con los resultados esperados.
-
-## Próxima entrega
-
-Quedan pendientes la venta web, cancelaciones, pagos, múltiples buses, interfaz gráfica y persistencia en una base de datos. Este avance se centra en demostrar memoria compartida y exclusión mutua entre procesos.
+La prueba envía solicitudes HTTP concurrentes para el mismo asiento, comprueba que solo una se confirme, ejecuta el ciclo de pago y cancelación y reinicia el servidor para verificar la persistencia.
